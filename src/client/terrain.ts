@@ -1,501 +1,368 @@
 import { Queue } from 'queue-typescript'
-import { randomInt, clamp } from './util'
-import createColormap from 'colormap'
+import { randomInt, clamp, extent, normalize, timed } from './util'
+import { Grid } from './grid'
 import * as THREE from 'three'
 import * as d3 from 'd3'
 
-type Diamond = [number, number, number, number, number]
-type Triple = [number, number, number]
+/** A rectangle waiting to be subdivided: [left, bottom, right, top, noise amplitude]. */
+type Rect = [number, number, number, number, number]
+/** A BFS frontier cell: [x, y, city id]. */
+type Frontier = [number, number, number]
 
-export function buildTerrain(width: number, height: number, randomness: number, erosionIterations: number): Float32Array {
-    let start = performance.now()
+/** Working range of the diamond-square pass, before the map is normalized to 0..1. */
+const MAX_ELEVATION = 100
+/** Noise amplitude is divided by this at every subdivision level. */
+const RANDOM_DECAY = 2
 
-    function getPosition(x: number, y: number): number {
-        x = clamp(x, 0, width - 1)
-        y = clamp(y, 0, height - 1)
-        return y * width + x
-    }
+/**
+ * Diamond-square heightmap, thermally eroded and normalized to 0..1.
+ *
+ * `randomness` is the initial noise amplitude (in MAX_ELEVATION units) and halves with every
+ * subdivision, so larger values give rougher terrain.
+ */
+export function buildTerrain(
+    grid: Grid,
+    randomness: number,
+    erosionIterations: number
+): Float32Array {
+    const data = new Float32Array(grid.length) // the four corners start at 0
+
+    // Fades the map towards 0 near the edges, so the result reads as an island.
     function borderProximity(x: number, y: number): number {
-        let closest = Math.min(x / width, y / height, (width - 1 - x) / width, (height - 1 - y) / height)
+        const { width, height } = grid
+        const closest = Math.min(
+            x / width,
+            y / height,
+            (width - 1 - x) / width,
+            (height - 1 - y) / height
+        )
         return Math.pow(closest, 0.05)
     }
 
-    // init data and set corners to 0
-    const data = new Float32Array(width * height)
-    data[getPosition(0,0)] = 0
-    data[getPosition(width - 1, 0)] = 0
-    data[getPosition(0, height - 1)] = 0
-    data[getPosition(width - 1, height - 1)] = 0
+    const at = (x: number, y: number) => data[grid.index(x, y)]
 
-    const randomDecay = 2
-    let iterations = 0
-    let queue = new Queue<Diamond>([0, 0, width - 1, height - 1, randomness])
-    while (queue.length > 0) {
-        iterations++
-        let [left, bottom, right, top, rand] = queue.dequeue()
-        let centerX = Math.floor((left + right) / 2)
-        let centerY = Math.floor((top + bottom) / 2)
-
-        data[getPosition(centerX, centerY)] = Math.floor(clamp((Math.floor(
-            (data[getPosition(left, top)] + data[getPosition(left, bottom)] + 
-            data[getPosition(right, top)] + data[getPosition(right, bottom)]) / 4
-        ) + randomInt(-rand, rand)) * borderProximity(centerX, centerY), 0, 100))
-
-        if (top !== bottom) {
-            data[getPosition(centerX, top)] = Math.floor(clamp((Math.floor(
-                (data[getPosition(left, top)] + data[getPosition(right, top)] + 
-                data[getPosition(centerX, centerY)]) / 3
-            ) + randomInt(-rand, rand)) * borderProximity(centerX, top), 0, 100))
-            data[getPosition(centerX, bottom)] = Math.floor(clamp((Math.floor(
-                (data[getPosition(left, bottom)] + data[getPosition(right, bottom)] + data[getPosition(centerX, centerY)]) / 3
-            ) + randomInt(-rand, rand)) * borderProximity(centerX, bottom), 0, 100))
-        }
-
-        if (left !== right) {
-            data[getPosition(left, centerY)] = Math.floor(clamp((Math.floor(
-                (data[getPosition(left, top)] + data[getPosition(left, bottom)] + data[getPosition(centerX, centerY)]) / 3
-            ) + randomInt(-rand, rand)) * borderProximity(left, centerY), 0, 100))
-            data[getPosition(right, centerY)] = Math.floor(clamp((Math.floor(
-                (data[getPosition(right, top)] + data[getPosition(right, bottom)] + data[getPosition(centerX, centerY)]) / 3
-            ) + randomInt(-rand, rand)) * borderProximity(right, centerY), 0, 100))
-        }
-
-        if (right - left > 1 || top - bottom > 1) {
-            queue.enqueue([left, bottom, centerX, centerY, Math.floor(rand / randomDecay)])
-            queue.enqueue([left, centerY, centerX, top, Math.floor(rand / randomDecay)])
-            queue.enqueue([centerX, bottom, right, centerY, Math.floor(rand / randomDecay)])
-            queue.enqueue([centerX, centerY, right, top, Math.floor(rand / randomDecay)])
-        }
+    /** Sets (x, y) to the average of `sources`, jittered by +-rand and faded towards the border. */
+    function displace(x: number, y: number, rand: number, ...sources: number[]) {
+        const average = Math.floor(sources.reduce((sum, h) => sum + h, 0) / sources.length)
+        const jittered = (average + randomInt(-rand, rand)) * borderProximity(x, y)
+        data[grid.index(x, y)] = Math.floor(clamp(jittered, 0, MAX_ELEVATION))
     }
-    let end = performance.now()
-    console.log(`Heightmap generated in ${end - start}ms with ${iterations} iterations`)
 
-    thermalErode(data, width, height, erosionIterations)
+    timed('Heightmap generated', () => {
+        const queue = new Queue<Rect>([0, 0, grid.width - 1, grid.height - 1, randomness])
+        while (queue.length > 0) {
+            const [left, bottom, right, top, rand] = queue.dequeue()
+            const cx = Math.floor((left + right) / 2)
+            const cy = Math.floor((top + bottom) / 2)
 
-    start = performance.now()
-    let max = 0
-    let min = 100
-    for (let i = 0; i < data.length; i++) {
-        if (data[i] > max) {
-            max = data[i]
+            // Diamond step: the centre is the average of the four corners.
+            const corners = [at(left, top), at(left, bottom), at(right, top), at(right, bottom)]
+            displace(cx, cy, rand, ...corners)
+
+            // Square step: each edge midpoint averages its two corners and the new centre.
+            if (top !== bottom) {
+                displace(cx, top, rand, at(left, top), at(right, top), at(cx, cy))
+                displace(cx, bottom, rand, at(left, bottom), at(right, bottom), at(cx, cy))
+            }
+            if (left !== right) {
+                displace(left, cy, rand, at(left, top), at(left, bottom), at(cx, cy))
+                displace(right, cy, rand, at(right, top), at(right, bottom), at(cx, cy))
+            }
+
+            if (right - left > 1 || top - bottom > 1) {
+                const rest = Math.floor(rand / RANDOM_DECAY)
+                queue.enqueue([left, bottom, cx, cy, rest])
+                queue.enqueue([left, cy, cx, top, rest])
+                queue.enqueue([cx, bottom, right, cy, rest])
+                queue.enqueue([cx, cy, right, top, rest])
+            }
         }
-        if (data[i] < min) {
-            min = data[i]
-        }
-    }
-    for (let i = 0; i < data.length; i++) {
-        data[i] =  (data[i] - min) / (max - min)
-    }
-    end = performance.now()
-    console.log(`Heightmap normalized in ${end - start}ms`)
+    })
 
+    thermalErode(data, grid, erosionIterations)
+    normalize(data)
     return data
-}  
+}
 
-export function thermalErode(data: Float32Array, width: number, height: number, erosionIterations: number) {
-    function getPosition(x: number, y: number): number {
-        x = clamp(x, 0, width - 1)
-        y = clamp(y, 0, height - 1)
-        return y * width + x
-    }
-    let start = performance.now()
-    let iter = 0
-    while (iter < erosionIterations) {
-        for (let i = 1; i < width - 1; i++) {
-            for (let j = 1; j < height - 1; j ++) {
-                let neighbors = [[i - 1, j], [i + 1, j], [i, j - 1], [i, j + 1]]
-                let dMax = 0
-                let indices: [number, number] | null = null
-                
-                for (const [x, y] of neighbors) {
-                    let d = data[getPosition(i, j)] - data[getPosition(x, y)]
-                    if (d > dMax) {
-                        dMax = d
-                        indices = [x, y]
+/**
+ * Talus slippage: every interior cell gives half of its steepest downhill drop to that neighbour,
+ * which rounds off slopes that are too steep to hold material.
+ */
+export function thermalErode(data: Float32Array, grid: Grid, iterations: number) {
+    // Interior cells only, so plain index offsets are always in bounds.
+    const offsets = [-1, 1, -grid.width, grid.width]
+    timed(`Heightmap eroded (${iterations} iterations)`, () => {
+        for (let iteration = 0; iteration < iterations; iteration++) {
+            for (let x = 1; x < grid.width - 1; x++) {
+                for (let y = 1; y < grid.height - 1; y++) {
+                    const here = grid.index(x, y)
+                    let steepest = -1
+                    let drop = 0
+                    for (const offset of offsets) {
+                        const d = data[here] - data[here + offset]
+                        if (d > drop) {
+                            drop = d
+                            steepest = here + offset
+                        }
+                    }
+                    if (steepest >= 0) {
+                        data[here] -= drop / 2
+                        data[steepest] += drop / 2
                     }
                 }
-                
-                if (indices) {
-                    data[getPosition(i, j)] -= dMax / 2
-                    data[getPosition(indices[0], indices[1])] += dMax / 2
+            }
+        }
+    })
+}
+
+/**
+ * For every cell, the index of its lowest neighbour, or -1 on the border (where water leaves the
+ * map). When `strictlyDownhill`, cells that are already a local minimum also get -1.
+ */
+function downhillMap(data: Float32Array, grid: Grid, strictlyDownhill: boolean): Int32Array {
+    const downs = new Int32Array(grid.length)
+    for (let y = 0; y < grid.height; y++) {
+        for (let x = 0; x < grid.width; x++) {
+            const here = grid.index(x, y)
+            if (grid.isBorder(x, y)) {
+                downs[here] = -1
+                continue
+            }
+            let best = -1
+            let lowest = strictlyDownhill ? data[here] : Infinity
+            for (const neighbor of grid.neighbors(x, y)) {
+                if (data[neighbor] < lowest) {
+                    lowest = data[neighbor]
+                    best = neighbor
                 }
             }
+            downs[here] = best
         }
-        iter++
     }
-    let end = performance.now()
-    console.log(`Heightmap eroded in ${end - start}ms for ${erosionIterations} iterations`)
+    return downs
 }
 
-export function addRivers(data: Float32Array, width: number, height: number, numRivers: number, waterLevel: number) {
-    function getPosition(x: number, y: number): number {
-        x = clamp(x, 0, width - 1)
-        y = clamp(y, 0, height - 1)
-        return y * width + x
-    }
-    function getNeighbors(x: number, y: number) {
-        const neighbors = [];
-        for (let dy = -1; dy <= 1; dy++) {
-            for (let dx = -1; dx <= 1; dx++) {
-                if (dx === 0 && dy === 0) continue;
-                neighbors.push(getPosition(x + dx, y + dy));
-            }
-        }
-        return neighbors;
-    }
-    function downFrom(x: number, y: number) {
-        if (x === 0 || x === width - 1 || y === 0 || y === height - 1) { return -1}
-        let best = -1
-        let besth = 100
-        let nbs = getNeighbors(x, y)
-        for (const j of nbs) {
-            if (data[j] < besth) {
-                besth = data[j]
-                best = j
-            }
-        }
-        return best
-    }
-    var downs = new Float32Array(width * height)
-    for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-            downs[getPosition(x, y)] = downFrom(x, y)
-        }
-    }
-    let peaks = []
-    while (peaks.length < numRivers) {
-        let x = randomInt(1, width - 1)
-        let y = randomInt(1, height - 1)
-        if (data[getPosition(x, y)] > waterLevel + 0.01) {
-            peaks.push([x, y])
-        }
-    }
-    for (const [x, y] of peaks) {
-        let position = getPosition(x, y)
-        while (true) {
-            if (downs[position] >= 0 && data[position] > waterLevel) {
-                data[position] = 0
-                position = downs[position]
-            } else {
-                break
-            }
-        }
-    }
-}
-
-export function fillSinks(data: Float32Array, width: number, height: number, maxIters: number, waterLevel: number): Float32Array {
-    function getPosition(x: number, y: number): number {
-        x = clamp(x, 0, width - 1)
-        y = clamp(y, 0, height - 1)
-        return y * width + x
-    }
-    function getNeighbors(x: number, y: number) {
-        const neighbors = [];
-        for (let dy = -1; dy <= 1; dy++) {
-            for (let dx = -1; dx <= 1; dx++) {
-                if (dx === 0 && dy === 0) continue;
-                neighbors.push(getPosition(x + dx, y + dy));
-            }
-        }
-        return neighbors;
-    }
-    let start = performance.now()
-    const epsilon = 1e-3
-    const infinity = Number.MAX_SAFE_INTEGER
-    const surface = new Float32Array(width * height)
-    const dx = [-1, 0, 1, -1, 1, -1, 0, 1]
-    const dy = [-1, -1, -1, 0, 0, 1, 1, 1]
+/** Cells above water with nowhere lower to drain to. */
+function countSinks(data: Float32Array, grid: Grid, waterLevel: number): number {
     let sinks = 0
-    for (let y = 1; y < height - 1; y++) {
-        for (let x = 1; x < width - 1; x++) {
-            const pos = getPosition(x, y)
-            if (x === 0 || x === width - 1 || y === 0 || y === height - 1) {
-                surface[pos] = data[pos];
-            } else {
-                surface[pos] = infinity;
-            }
-            if (data[pos] <= waterLevel) continue
-            let sink = true
-            for (let i = 0; i < 8; i++) {
-                const nx = x + dx[i]
-                const ny = y + dy[i]
-                const npos = getPosition(nx, ny)
-
-                if (data[npos] < data[pos]) {
-                    sink = false
-                }
-            } 
-            if (sink) { sinks++ }
+    for (let y = 1; y < grid.height - 1; y++) {
+        for (let x = 1; x < grid.width - 1; x++) {
+            const here = grid.index(x, y)
+            if (data[here] <= waterLevel) continue
+            if (!grid.neighbors(x, y).some((n) => data[n] < data[here])) sinks++
         }
     }
-    console.log("num sinks", sinks)
+    return sinks
+}
 
-    let changed = true
-    let iters = 0
-    while (changed) {
-        changed = false
-        let changenum = 0
-        for (let y = 0; y < height; y++) {
-            for (let x = 0; x < width; x++) {
-                const i = getPosition(x, y)
-                if (surface[i] == data[i] || surface[i] < waterLevel) continue
+/** Picks random points above water and carves a channel down to sea level from each. */
+export function addRivers(data: Float32Array, grid: Grid, numRivers: number, waterLevel: number) {
+    const downs = downhillMap(data, grid, false)
 
-                const neighbors = getNeighbors(x, y);
-                for (const j of neighbors) {
-                    if (data[i] >= surface[j] + epsilon) {
-                        surface[i] = data[i]
-                        changed = true
-                        changenum++
-                        break
+    const sources: number[] = []
+    for (let tries = 0; sources.length < numRivers && tries < 10 * grid.length; tries++) {
+        const source = grid.index(randomInt(1, grid.width - 1), randomInt(1, grid.height - 1))
+        if (data[source] > waterLevel + 0.01) sources.push(source)
+    }
+
+    for (let position of sources) {
+        while (downs[position] >= 0 && data[position] > waterLevel) {
+            data[position] = 0
+            position = downs[position]
+        }
+    }
+}
+
+/**
+ * Planchon-Darboux depression filling: raises the land inside basins until every cell above water
+ * has a downhill route off the map, so rivers and flux never dead-end.
+ */
+export function fillSinks(data: Float32Array, grid: Grid, maxIters: number, waterLevel: number) {
+    const EPSILON = 1e-3
+    /** Stand-in for "infinitely high", kept finite so it can never poison the height texture. */
+    const UNRESOLVED = Number.MAX_SAFE_INTEGER
+
+    timed('Sinks filled', () => {
+        console.log(`Sinks before filling: ${countSinks(data, grid, waterLevel)}`)
+
+        // Border cells drain off the map at height 0; everything else starts infinitely high and
+        // is relaxed down towards the cheapest route out.
+        const surface = new Float32Array(grid.length)
+        for (let y = 1; y < grid.height - 1; y++) {
+            for (let x = 1; x < grid.width - 1; x++) {
+                surface[grid.index(x, y)] = UNRESOLVED
+            }
+        }
+
+        let pass = 0
+        for (; pass <= maxIters; pass++) {
+            let changed = false
+            for (let y = 0; y < grid.height; y++) {
+                for (let x = 0; x < grid.width; x++) {
+                    const here = grid.index(x, y)
+                    if (surface[here] === data[here] || surface[here] < waterLevel) continue
+
+                    for (const neighbor of grid.neighbors(x, y)) {
+                        if (data[here] >= surface[neighbor] + EPSILON) {
+                            // There is already a way out at our own height: nothing to fill.
+                            surface[here] = data[here]
+                            changed = true
+                            break
+                        }
+                        // Otherwise settle just above the neighbour, keeping a slight downhill
+                        // gradient across the filled basin.
+                        const raised = surface[neighbor] + 1 / randomInt(1000, 10000)
+                        if (surface[here] > raised && raised > data[here]) {
+                            surface[here] = raised
+                            changed = true
+                        }
                     }
-                    const oh = surface[j] + 1 / randomInt(1000, 10000)
-                    if (surface[i] > oh && oh > data[i]) {
-                        surface[i] = oh
-                        changed = true
-                        changenum++
-                    }
                 }
             }
+            if (!changed) break
         }
-        if (!changed) break
-        iters++
-        if (iters > maxIters) break
-    }
-    console.log(iters)
+        console.log(`Sinks converged after ${pass} of at most ${maxIters + 1} passes`)
 
-    for (let i = 0; i < data.length; i++) {
-        if (data[i] > waterLevel) {
-            data[i] = surface[i]
+        for (let i = 0; i < data.length; i++) {
+            if (data[i] > waterLevel) data[i] = surface[i]
         }
-    }
-    sinks = 0
-    for (let y = 1; y < height - 1; y++) {
-        for (let x = 1; x < width - 1; x++) {
-            const pos = getPosition(x, y)
-            if (data[pos] <= waterLevel) continue
-            let sink = true
-            for (let i = 0; i < 8; i++) {
-                const nx = x + dx[i]
-                const ny = y + dy[i]
-                const npos = getPosition(nx, ny)
-
-                if (data[npos] < data[pos]) {
-                    sink = false
-                }
-            } 
-            if (sink) { sinks++ }
-        }
-    }
-    console.log("num sinks", sinks)
-
-    let end = performance.now()
-    console.log(`Sinks filled in ${end - start}ms`)
-    return data
+        console.log(`Sinks after filling: ${countSinks(data, grid, waterLevel)}`)
+    })
 }
 
-export function fluxErode(data: Float32Array, width: number, height: number, amount: number): Float32Array {
-    function getPosition(x: number, y: number): number {
-        x = clamp(x, 0, width - 1)
-        y = clamp(y, 0, height - 1)
-        return y * width + x
-    }
-    function getNeighbors(x: number, y: number) {
-        const neighbors = [];
-        for (let dy = -1; dy <= 1; dy++) {
-            for (let dx = -1; dx <= 1; dx++) {
-                if (dx === 0 && dy === 0) continue;
-                neighbors.push(getPosition(x + dx, y + dy));
-            }
+/**
+ * Hydraulic erosion. Every cell sheds one unit of water, which is routed downhill and accumulated,
+ * then each cell is lowered in proportion to the drainage passing through it, carving valleys.
+ */
+export function fluxErode(data: Float32Array, grid: Grid, amount: number) {
+    timed('Heightmap flux eroded', () => {
+        const downs = downhillMap(data, grid, true)
+
+        const flux = new Float32Array(grid.length).fill(1)
+        const byDescendingHeight = new Int32Array(grid.length)
+        for (let i = 0; i < byDescendingHeight.length; i++) byDescendingHeight[i] = i
+        byDescendingHeight.sort((a, b) => data[b] - data[a])
+        for (const i of byDescendingHeight) {
+            if (downs[i] >= 0) flux[downs[i]] += flux[i]
         }
-        return neighbors;
-    }
-    function downFrom(x: number, y: number) {
-        if (x === 0 || x === width - 1 || y === 0 || y === height - 1) { return -1}
-        let best = -1
-        let besth = data[getPosition(x, y)]
-        let nbs = getNeighbors(x, y)
-        for (const j of nbs) {
-            if (data[j] < besth) {
-                besth = data[j]
-                best = j
-            }
+
+        const maxFlux = extent(flux)[1] || 1
+        for (let i = 0; i < data.length; i++) {
+            data[i] = Math.max(data[i] - amount * (flux[i] / maxFlux), 0)
         }
-        return best
-    }
-    var downs = new Float32Array(width * height)
-    for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-            downs[getPosition(x, y)] = downFrom(x, y)
-        }
-    }
-    const flux = new Float32Array(width * height)
-    var idxs = []
-    for (var i = 0; i < data.length; i++) {
-        idxs[i] = i
-        flux[i] = 1
-    }
-    idxs.sort(function (a, b) {
-        return data[b] - data[a]
-    });
-    for (var i = 0; i < data.length; i++) {
-        var j = idxs[i]
-        if (downs[j] >= 0) {
-            flux[downs[j]] += flux[j]
-        }
-    }
-    let maxFlux = 0
-    for (let i = 0; i < flux.length; i++) {
-        if (flux[i] > maxFlux) {maxFlux = flux[i]}
-    }
-    for (let i = 0; i < flux.length; i++) {
-        data[i] = Math.max(data[i] - amount * (flux[i] / maxFlux), 0)
-    }
-    let max = 0
-    for (let i = 0; i < data.length; i++) {
-        if (data[i] > max) {
-            max = data[i]
-        }
-    }
-    for (let i = 0; i < data.length; i++) {
-        data[i] =  data[i] / max
-    }
-    return data
+
+        // Rescale back to 0..1 without lifting the sea floor.
+        const max = extent(data)[1] || 1
+        for (let i = 0; i < data.length; i++) data[i] /= max
+    })
 }
 
-export function cityMap(data: Float32Array, width: number, height: number, waterLevel: number, numCities: number): Uint8Array {
-    const cityMap = new Uint8Array(width * height)
-    function getPosition(x: number, y: number): number {
-        x = clamp(x, 0, width - 1)
-        y = clamp(y, 0, height - 1)
-        return y * width + x
-    }
-    function getDistance(x1: number, y1: number, x2: number, y2: number) {
-        x1 = x1 / (width - 1)
-        x2 = x2 / (width - 1)
-        y1 = y1 / (height - 1)
-        y2 = y2 / (height - 1)
-        return Math.sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2))
-    }
-    function getNeighbors(x: number, y: number) {
-        const neighbors: [number, number][] = []
-        const dxs = [-1, 0, 1, 0]
-        const dys = [0, -1, 0, 1]
-        for (let i = 0; i < 4; i++) {
-            let dx = dxs[i]
-            let dy = dys[i]
-            if (0 < x + dx && x + dx < width - 1 && 0 < y + dy && y + dy < height - 1)  {
-                neighbors.push([x + dx, y + dy])
-            }
-        }
-        return neighbors;
-    }
-    let possibleCities: [number, number][] = []
-    for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-            let pos = getPosition(x, y)
-            if (data[pos] < waterLevel) continue
-            possibleCities.push([x, y])
-            // let nbs = getNeighbors(x, y)
-            // for (const [x2, y2] of nbs) {
-            //     let pos = getPosition(x2, y2)
-            //     if (data[pos] <= waterLevel) {
-            //         possibleCities.push([x, y])
-            //         break
-            //     }
-            // }
+/**
+ * Places `numCities` cities greedily, each one as far as possible from those already placed, then
+ * labels every land cell with the id (1-based; 0 means water) of the city that reaches it first.
+ */
+export function cityMap(
+    data: Float32Array,
+    grid: Grid,
+    waterLevel: number,
+    numCities: number
+): Uint8Array {
+    const land: [number, number][] = []
+    for (let y = 0; y < grid.height; y++) {
+        for (let x = 0; x < grid.width; x++) {
+            if (data[grid.index(x, y)] >= waterLevel) land.push([x, y])
         }
     }
-    let cities: [number, number][] = []
-    while (cities.length < numCities) {
-        let maxScore = 0
-        let maxPos: [number, number] = [0, 0]
-        for (const [x, y] of possibleCities) {
-            let pos = getPosition(x, y)
-            let minDist = width * width + height * height
-            for (const [x2, y2] of cities) {
-                let dist = getDistance(x, y, x2, y2)
-                if (dist < minDist) minDist = dist
-            }
-            let score = minDist
-            // let nbs = getNeighbors(x, y)
-            // for (const [x2, y2] of nbs) {
-            //     let pos = getPosition(x2, y2)
-            //     if (data[pos] < waterLevel) {
-            //         score += 1
-            //         break
-            //     } 
-            // }
-            if (score > maxScore) {
-                maxScore = score
-                maxPos = [x, y]
+
+    // Farthest-point sampling, maintaining each candidate's distance to the closest city so far.
+    const nearest = new Float64Array(land.length).fill(Infinity)
+    const cities: [number, number][] = []
+    while (cities.length < numCities && cities.length < land.length) {
+        let bestScore = 0
+        let best = 0
+        for (let i = 0; i < land.length; i++) {
+            if (nearest[i] > bestScore) {
+                bestScore = nearest[i]
+                best = i
             }
         }
-        cities.push(maxPos)
+        const [cityX, cityY] = land[best]
+        cities.push([cityX, cityY])
+        for (let i = 0; i < land.length; i++) {
+            nearest[i] = Math.min(nearest[i], grid.distance(land[i][0], land[i][1], cityX, cityY))
+        }
     }
-    console.log(cities)
-    let i = 1
-    let q = new Queue<Triple>()
-    for (const [x, y] of cities) {
-        cityMap[getPosition(x, y)] = i
-        q.enqueue([x, y, i])
-        i++        
-    }
-    while (q.length > 0) {
-        let [x, y, i] = q.dequeue()
-        let nbs = getNeighbors(x, y)
-        for (const [x2, y2] of nbs) {
-            let pos = getPosition(x2, y2)
-            if (data[pos] > waterLevel && cityMap[pos] == 0) {
-                cityMap[pos] = i
-                q.enqueue([x2, y2, i])
+
+    // Flood fill outwards from every city at once to get their territories.
+    const territories = new Uint8Array(grid.length)
+    const queue = new Queue<Frontier>()
+    cities.forEach(([x, y], i) => {
+        territories[grid.index(x, y)] = i + 1
+        queue.enqueue([x, y, i + 1])
+    })
+    while (queue.length > 0) {
+        const [x, y, city] = queue.dequeue()
+        for (const [nx, ny] of grid.orthogonalInteriorNeighbors(x, y)) {
+            const neighbor = grid.index(nx, ny)
+            if (data[neighbor] > waterLevel && territories[neighbor] === 0) {
+                territories[neighbor] = city
+                queue.enqueue([nx, ny, city])
             }
         }
     }
-    return cityMap
+    return territories
 }
 
-export function terrainToRGB(data: Float32Array, width: number, height: number, waterLevel: number): THREE.DataTexture {
-    const rgbData = new Uint8Array(4 * data.length)
-    for (let i = 0; i < data.length; i++) {
-        let color;
-        if (data[i] < waterLevel) {
-            color = d3.color(d3.interpolateMagma(0))!.rgb()
-        } else {
-            color = d3.color(d3.interpolateMagma(data[i]))!.rgb()
-        }
-        rgbData[i * 4] = color.r
-        rgbData[i * 4 + 1] = color.g
-        rgbData[i * 4 + 2] = color.b
-        rgbData[i * 4 + 3] = 255
+/** Builds an RGBA byte texture by evaluating `colorAt` (any CSS colour) for every cell. */
+function colorTexture(
+    grid: Grid,
+    count: number,
+    colorAt: (i: number) => string
+): THREE.DataTexture {
+    const pixels = new Uint8Array(4 * count)
+    for (let i = 0; i < count; i++) {
+        const { r, g, b } = d3.rgb(colorAt(i))
+        pixels[i * 4] = r
+        pixels[i * 4 + 1] = g
+        pixels[i * 4 + 2] = b
+        pixels[i * 4 + 3] = 255
     }
-    const rgbMap = new THREE.DataTexture(rgbData, width, height)
-    rgbMap.needsUpdate = true
-    return rgbMap
+    const texture = new THREE.DataTexture(pixels, grid.width, grid.height)
+    texture.needsUpdate = true
+    return texture
 }
 
-export function cityToRGB(data: Uint8Array, width: number, height: number, numCities: number): THREE.DataTexture {
-    const rgbData = new Uint8Array(4 * data.length)
-    for (let i = 0; i < data.length; i++) {
-        let color = d3.color(d3.interpolateRainbow(data[i] / numCities))!.rgb()
-        rgbData[i * 4] = color.r
-        rgbData[i * 4 + 1] = color.g
-        rgbData[i * 4 + 2] = color.b
-        rgbData[i * 4 + 3] = 255
-    }
-    const rgbMap = new THREE.DataTexture(rgbData, width, height)
-    rgbMap.needsUpdate = true
-    return rgbMap 
+/** Terrain shaded by elevation, with everything below the water level flattened to sea colour. */
+export function terrainToRGB(
+    data: Float32Array,
+    grid: Grid,
+    waterLevel: number
+): THREE.DataTexture {
+    return colorTexture(grid, data.length, (i) =>
+        d3.interpolateMagma(data[i] < waterLevel ? 0 : data[i])
+    )
 }
 
-export function terrainToDisMap(data: Float32Array, width: number, height: number): THREE.DataTexture {
-    const disData = new Float32Array(4 * data.length)
+/** One colour per city territory. */
+export function cityToRGB(
+    territories: Uint8Array,
+    grid: Grid,
+    numCities: number
+): THREE.DataTexture {
+    return colorTexture(grid, territories.length, (i) =>
+        d3.interpolateRainbow(territories[i] / numCities)
+    )
+}
+
+/** The heightmap as a float texture, for use as the mesh's displacement map. */
+export function terrainToDisMap(data: Float32Array, grid: Grid): THREE.DataTexture {
+    const pixels = new Float32Array(4 * data.length)
     for (let i = 0; i < data.length; i++) {
-        disData[i * 4] = data[i]
-        disData[i * 4 + 1] = data[i]
-        disData[i * 4 + 2] = data[i]
-        disData[i * 4 + 3] = 1.0
+        pixels[i * 4] = pixels[i * 4 + 1] = pixels[i * 4 + 2] = data[i]
+        pixels[i * 4 + 3] = 1.0
     }
-    const disMap = new THREE.DataTexture(disData, width, height, THREE.RGBAFormat, THREE.FloatType)
-    disMap.needsUpdate = true
-    return disMap
+    const { width, height } = grid
+    const texture = new THREE.DataTexture(pixels, width, height, THREE.RGBAFormat, THREE.FloatType)
+    texture.needsUpdate = true
+    return texture
 }
